@@ -14,12 +14,13 @@ from xml.dom import minidom
 from .ephys_gui import EphysGUI
 from PyQt5.QtWidgets import QApplication
 import re
+import warnings
 
 class Phy(BaseLoader):
     """
     Loader for Phy data
     """
-    def __init__(self, path):
+    def __init__(self, path, valid_group_labels=["good"]):
         """
         Instantiate the data class from a Phy folder.
         
@@ -27,9 +28,13 @@ class Phy(BaseLoader):
         ----------
         path : str
             The path to the data.
+        valid_groups : list of str
+            The info label for spikes to load, from KS classification (e.g. "goood", "mua")
         """     
         self.basename = os.path.basename(path)
         self.time_support = None
+        self._valid_group_labels = valid_group_labels
+        self._spikes = None
         
         super().__init__(path)
 
@@ -97,7 +102,32 @@ class Phy(BaseLoader):
            
         return
 
-    def load_phy_spikes(self,path, time_support=None):
+    @property
+    def valid_group_labels(self):
+        """This is a property to stress that it is read-only. changing it would mess with the caching of spike selection
+        """
+        return self._valid_group_labels
+
+    @property
+    def cluster_id_good(self):
+        """Read only required spikes (by default, all labelled "good"). To read others/more, set self.valid_groups
+        """
+        try:  #TODO instead of try-except we could get available info columns from spikes obj - if there's a option
+            info_df = self._all_spikes.get_info('label')
+            return info_df[info_df.isin(self.valid_group_labels)].index.values
+        except KeyError:
+            return np.array(self._all_spikes.keys())
+
+    @property
+    def spikes(self):
+        """Filter in spikes that would be included with the valid_group_labels selection. Cache as this indexing
+        can take 1-2 s.
+        """
+        if self._spikes is None:
+            self._spikes = self._all_spikes[self.cluster_id_good]
+        return self._spikes
+
+    def load_phy_spikes(self, path, time_support=None):
         """
         Load Phy spike times and convert to NWB.
         Instantiate automatically a TsGroup object.
@@ -124,14 +154,13 @@ class Phy(BaseLoader):
         """
         files = os.listdir(path)
 
-        has_cluster_info = False
+
         if 'cluster_info.tsv' in files:
-            self.cluster_info = pd.read_csv(os.path.join(path, 'cluster_info.tsv'), sep='\t', index_col='cluster_id')
-            cluster_id_good = self.cluster_info[self.cluster_info.group=='good'].index.values
             has_cluster_info = True
+            cluster_info = pd.read_csv(os.path.join(path, 'cluster_info.tsv'), sep='\t', index_col='cluster_id')
         elif 'cluster_group.tsv' in files:
-            self.cluster_group = pd.read_csv(os.path.join(path, 'cluster_group.tsv'), sep='\t', index_col='cluster_id')
-            cluster_id_good = self.cluster_group[self.cluster_group.group=='good'].index.values
+            has_cluster_info = False
+            cluster_info = pd.read_csv(os.path.join(path, 'cluster_group.tsv'), sep='\t', index_col='cluster_id')
         else:
             raise RuntimeError("Can't find cluster_info.tsv or cluster_group.tsv in {};".format(path))
 
@@ -139,40 +168,48 @@ class Phy(BaseLoader):
         spike_clusters = np.load(os.path.join(path, 'spike_clusters.npy'))
 
         spikes = {}
-        for n in cluster_id_good:
+        for n in cluster_info.index:
             spikes[n] = nap.Ts(t=spike_times[spike_clusters==n]/self.sample_rate, time_support=time_support)
+        self._all_spikes = nap.TsGroup(spikes, time_support=time_support)
 
-        self.spikes = nap.TsGroup(spikes, time_support=time_support)
+        # Adding classification label (good, mua, etc):
+        group_col_name = None
+        for col in ["group", "KSLabel"]:
+            if col in cluster_info:
+                group_col_name = col
+        if group_col_name is None:
+            raise RuntimeError("Can't find column 'group' or 'KSLabel' in cluster_group.tsv")
+
+        self._all_spikes.set_info(label=cluster_info[group_col_name])
 
         # Adding the position of the electrodes in case
         self.channel_positions = np.load(os.path.join(path, 'channel_positions.npy'))
 
         # Adding shank group info from cluster_info if present
-        if has_cluster_info:
-            group = self.cluster_info.loc[cluster_id_good,'sh']
-            self.spikes.set_info(group=group)
+        if has_cluster_info and "sh" in cluster_info:
+            group = cluster_info['sh']
+            self._all_spikes.set_info(group=group)
         else:
             template = np.load(os.path.join(path, 'templates.npy'))
-            template = template[cluster_id_good]
+            template = template[cluster_info.index]
             ch = np.power(template, 2).max(1).argmax(1)            
-            group = pd.Series(index=cluster_id_good,data=self.ch_to_sh[ch].values)
-            self.spikes.set_info(group=group)
+            group = pd.Series(index=cluster_info.index, data=self.ch_to_sh[ch].values)
+            self._all_spikes.set_info(group=group)
 
         names = pd.Series(
-            index = group.index,
-            data = [self.ephys_information[group.loc[i]]['name'] for i in group.index]
+            index=group.index,
+            data=[self.ephys_information[group.loc[i]]['name'] for i in group.index]
             )
         if ~np.all(names.values==''):
-            self.spikes.set_info(name=names)
+            self._all_spikes.set_info(name=names)
 
         locations = pd.Series(
-            index = group.index,
-            data = [self.ephys_information[group.loc[i]]['location'] for i in group.index]
+            index=group.index,
+            data=[self.ephys_information[group.loc[i]]['location'] for i in group.index]
             )
         if ~np.all(locations.values==''):
-            self.spikes.set_info(location=locations)
+            self._all_spikes.set_info(location=locations)
 
-        return
 
     def save_data(self, path):
         """
@@ -230,13 +267,15 @@ class Phy(BaseLoader):
         # Adding units
         nwbfile.add_unit_column('location', 'the anatomical location of this unit')
         nwbfile.add_unit_column('group', 'the group of the unit')
-        for u in self.spikes.keys():
+        nwbfile.add_unit_column('label', 'the label of the unit, from spike sorting')
+        for u in self._all_spikes.keys():
             nwbfile.add_unit(
                 id=u,
-                spike_times=self.spikes[u].as_units('s').index.values,                
-                electrode_group=electrode_groups[self.spikes.get_info('group').loc[u]],
-                location=self.ephys_information[self.spikes.get_info('group').loc[u]]['location'],
-                group=self.spikes.get_info('group').loc[u]
+                spike_times=self._all_spikes[u].as_units('s').index.values,
+                electrode_group=electrode_groups[self._all_spikes.get_info('group').loc[u]],
+                location=self.ephys_information[self._all_spikes.get_info('group').loc[u]]['location'],
+                group=self._all_spikes.get_info('group').loc[u],
+                label=self._all_spikes.get_info('label').loc[u]
                 )
 
         io.write(nwbfile)
@@ -276,15 +315,13 @@ class Phy(BaseLoader):
             units = nwbfile.units.to_dataframe()
             spikes = {n:nap.Ts(t=units.loc[n,'spike_times'], time_units='s') for n in units.index}
 
-            self.spikes = nap.TsGroup(
-                spikes, 
-                time_support=self.time_support,
-                time_units='s',
-                group=units['group']
-                )
+            ts_group_kwargs = dict(time_support=self.time_support, time_units='s', group=units['group'])
+            if "label" in units.columns:
+                ts_group_kwargs["label"] = units['label']
+            self._all_spikes = nap.TsGroup(spikes, **ts_group_kwargs)
 
             if ~np.all(units['location']==''):
-                self.spikes.set_info(location=units['location'])
+                self._all_spikes.set_info(location=units['location'])
 
             io.close()
             return True

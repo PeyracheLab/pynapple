@@ -107,7 +107,7 @@ class TsGroup(UserDict):
                 raise RuntimeError("Intersection of time supports is empty. Consider passing a time support as argument.")
             self.time_support = time_support                
             data = {k:data[k].restrict(self.time_support) for k in index}
-
+        #print(data)
         UserDict.__init__(self, data)
         
         # Making the TsGroup non mutable

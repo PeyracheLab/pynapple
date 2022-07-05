@@ -100,7 +100,7 @@ class Tsd(pd.Series):
 
         t = TimeUnits.format_timestamps(t, time_units)
 
-        if len(t):
+        if len(t) > 0:
             if time_support is not None:
                 bins = time_support.values.ravel()
                 # Because yes there is no funtion with both bounds closed as an option
@@ -127,7 +127,10 @@ class Tsd(pd.Series):
             super().__init__(index=t, data=d, dtype=np.float64)
 
         self.time_support = time_support
-        self.rate = len(t)/self.time_support.tot_length('s')
+        if self.time_support.tot_length('s') > 0:
+            self.rate = len(t) / self.time_support.tot_length('s')
+        else:
+            self.rate = np.nan
         self.index.name = "Time (s)"
         self._metadata.append("nap_class")
         self.nap_class = self.__class__.__name__
