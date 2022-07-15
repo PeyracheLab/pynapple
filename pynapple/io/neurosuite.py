@@ -532,10 +532,8 @@ class NeuroSuite(BaseLoader):
             windows = windows[(windows>=epstart) & (windows<=epend)]
         batches = []
         for i in windows: #make overlapping batches from the beginning to end of recording
-            if i == windows[-1]:
-                batches.append([i-overlap, n_samples])
-            elif i-30 >= 0 and i+30 <= n_samples:
-                batches.append([i-overlap, i+batch_size+overlap])
+            if i == windows[-1]: #the last batch cannot overlap with the next one
+                batches.append([i, n_samples])
             else:
                 batches.append([i, i+batch_size+overlap])
         batches = [np.int32(batch) for batch in batches]
@@ -552,7 +550,7 @@ class NeuroSuite(BaseLoader):
         spike_check = np.array([int(spikes_neuron) for spikes_neuron in sample_counted_spikes[neuron] for neuron in sample_counted_spikes])
 
         for index, timestep in enumerate(batches):
-            print('Extracting waveforms from dat file: window ' + str(index+1) + '/' + str(len(windows)))
+            print(f'Extracting waveforms from dat file: window {index+1} / {len(windows)}', end = '\r')
  
             if len(spike_check[(timestep[0]<spike_check) & (timestep[1]>spike_check)]) == 0:
                 continue #if there are no spikes for any neurons in this batch, skip and go to the next one
@@ -570,8 +568,11 @@ class NeuroSuite(BaseLoader):
 
                 for time in tmp2: #add each spike waveform to neuron_waveform
                     spikewindow = tmpn.loc[time-waveform_window[0]:time+waveform_window[1]-1] #waveform for this spike time
-                    if spikewindow.isnull().values.any() == False:
+                    try:
                         neuron_waveforms[neuron] += spikewindow.values
+                    except: #ignore if full waveform is not present in this batch
+                        pass
+                    
         meanwf = {n: pd.DataFrame(data = np.array(neuron_waveforms[n])/spike_count, 
                                   columns = np.arange(len(group_to_channel[group[n]])), 
                                   index = np.array(np.arange(-waveform_window[0], waveform_window[1]))/fs) for n in sample_counted_spikes}
